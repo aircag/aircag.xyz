@@ -1,0 +1,60 @@
+---
+import BaseLayout from './BaseLayout.astro';
+
+interface Props {
+  title: string;
+  description: string;
+  date: Date;
+  tags: string[];
+}
+
+const { title, description, date, tags } = Astro.props;
+const formattedDate = date.toISOString().split('T')[0];
+---
+
+<BaseLayout title={title} description={description}>
+  <article>
+    <header class="mb-10 pb-8 border-b border-[#1e293b]">
+      <div class="flex flex-wrap gap-2 mb-4">
+        {
+          tags.map((tag) => (
+            <span class="font-mono text-xs text-[#22d3ee] bg-[#22d3ee]/10 px-2 py-0.5 rounded">
+              #{tag}
+            </span>
+          ))
+        }
+      </div>
+      <h1 class="text-2xl font-semibold text-slate-100 leading-snug mb-3">{title}</h1>
+      <time datetime={date.toISOString()} class="font-mono text-xs text-slate-500">
+        {formattedDate}
+      </time>
+    </header>
+
+    <div
+      class="prose prose-invert prose-sm max-w-none
+        prose-headings:font-semibold prose-headings:text-slate-100
+        prose-a:text-[#22d3ee] prose-a:no-underline hover:prose-a:underline
+        prose-code:text-[#22d3ee] prose-code:bg-[#111] prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded prose-code:font-mono prose-code:text-sm prose-code:before:content-none prose-code:after:content-none
+        prose-pre:bg-[#111] prose-pre:border prose-pre:border-[#1e293b] prose-pre:rounded
+        prose-blockquote:border-l-[#22d3ee] prose-blockquote:text-slate-400
+        prose-strong:text-slate-200
+        prose-p:text-slate-300 prose-p:leading-relaxed
+        prose-li:text-slate-300
+        prose-hr:border-[#1e293b]
+        prose-table:text-slate-300
+        prose-th:text-slate-200 prose-th:border-[#1e293b]
+        prose-td:border-[#1e293b]"
+    >
+      <slot />
+    </div>
+
+    <div class="mt-12 pt-8 border-t border-[#1e293b]">
+      <a
+        href="/blog"
+        class="font-mono text-sm text-slate-400 hover:text-[#22d3ee] transition-colors"
+      >
+        ← back to blog
+      </a>
+    </div>
+  </article>
+</BaseLayout>
