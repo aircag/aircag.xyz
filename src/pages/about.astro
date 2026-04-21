@@ -1,0 +1,41 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+---
+
+<BaseLayout
+  title="About"
+  description="About aircag, security researcher focused on smart contract auditing, on-chain investigations, and general security research."
+>
+  <div class="mb-8">
+    <h1 class="font-mono text-xs text-slate-500 uppercase tracking-widest">about</h1>
+  </div>
+
+  <div
+    class="prose prose-invert prose-sm max-w-none
+      prose-headings:font-semibold prose-headings:text-slate-100 prose-headings:font-mono
+      prose-a:text-[#22d3ee] prose-a:no-underline hover:prose-a:underline
+      prose-p:text-slate-300 prose-p:leading-relaxed
+      prose-li:text-slate-300
+      prose-strong:text-slate-200
+      prose-hr:border-[#1e293b]"
+  >
+    <p>
+      I'm aircag, a security researcher focused on smart contract auditing, on-chain investigations,
+      and general security research. This blog is where I document findings, writeups, and things I
+      find interesting while down the rabbit hole.
+    </p>
+
+    <h2>focus areas</h2>
+    <ul>
+      <li><strong>Smart Contract Security</strong></li>
+      <li><strong>Blockchain Investigations</strong></li>
+      <li><strong>Forensics and Blue Teaming</strong></li>
+      <li><strong>General Security Research</strong></li>
+    </ul>
+
+    <h2>contact</h2>
+    <p>
+      <a href="mailto:aircag@proton.me">aircag@proton.me</a>
+    </p>
+  </div>
+</BaseLayout>

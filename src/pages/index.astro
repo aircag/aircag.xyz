@@ -1,0 +1,51 @@
+---
+import { getCollection } from 'astro:content';
+import BaseLayout from '../layouts/BaseLayout.astro';
+import PostCard from '../components/PostCard.astro';
+
+const allPosts = await getCollection('blog', ({ data }) => {
+  return import.meta.env.PROD ? data.draft !== true : true;
+});
+
+const latestPosts = allPosts
+  .sort((a, b) => b.data.date.valueOf() - a.data.date.valueOf())
+  .slice(0, 5);
+---
+
+<BaseLayout title="Home">
+  <section class="mb-12">
+    <p class="text-slate-300 leading-relaxed max-w-lg text-[15px]">
+      Personal blog where I document security investigations and things I find interesting.
+    </p>
+    <div class="mt-5 flex flex-wrap gap-2">
+      {
+        ['security', 'web3', 'blockchain', 'forensic', 'blueteaming'].map((tag) => (
+          <span class="font-mono text-xs text-[#22d3ee]/60 border border-[#22d3ee]/20 px-2 py-1 rounded">
+            {tag}
+          </span>
+        ))
+      }
+    </div>
+  </section>
+
+  <section>
+    <div class="flex items-center justify-between mb-2">
+      <h2 class="font-mono text-xs text-slate-500 uppercase tracking-widest">latest posts</h2>
+      <a href="/blog" class="font-mono text-xs text-[#22d3ee] hover:underline">all posts →</a>
+    </div>
+    <div class="border-t border-[#1e293b]">
+      {
+        latestPosts.map((post) => (
+          <PostCard
+            title={post.data.title}
+            slug={post.id.replace(/\.(md|mdx)$/, '')}
+            date={post.data.date}
+            tags={post.data.tags}
+            description={post.data.description}
+          />
+        ))
+      }
+      {latestPosts.length === 0 && <p class="py-8 text-sm text-slate-500 font-mono">no posts yet.</p>}
+    </div>
+  </section>
+</BaseLayout>
