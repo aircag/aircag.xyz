@@ -9,11 +9,15 @@ const currentPath = Astro.url.pathname;
 
 <header class="w-full border-b border-[#1e293b]">
   <nav class="max-w-3xl mx-auto px-6 py-4 flex items-center justify-between">
-    <a
-      href="/"
-      class="font-mono text-[#22d3ee] hover:text-white transition-colors text-sm font-medium"
-    >
-      aircag.xyz
+    <a href="/" class="flex items-center gap-3 group">
+      <img
+        src="/aircag.png"
+        alt="aircag"
+        class="w-7 h-7 rounded-full object-cover ring-1 ring-[#1e293b] group-hover:ring-[#22d3ee] transition-all"
+      />
+      <span class="font-mono text-[#22d3ee] group-hover:text-white transition-colors text-sm font-medium">
+        aircag.xyz
+      </span>
     </a>
     <ul class="flex items-center gap-6">
       {
