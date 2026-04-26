@@ -5,3 +5,78 @@
   --font-family-mono: "JetBrains Mono", monospace;
   --font-family-sans: Inter, ui-sans-serif, system-ui, sans-serif;
 }
+
+/* collapsible code blocks */
+details {
+  border: 1px solid #1e293b;
+  border-radius: 4px;
+  margin: 1.25rem 0;
+  outline: none;
+}
+
+details summary {
+  cursor: pointer;
+  padding: 0.5rem 0.875rem;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.72rem;
+  color: #64748b;
+  user-select: none;
+  -webkit-user-select: none;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  transition: color 0.15s;
+  outline: none;
+}
+
+details summary::before {
+  content: "▶";
+  font-size: 0.6rem;
+  flex-shrink: 0;
+  transition: transform 0.15s;
+}
+
+details[open] summary::before {
+  transform: rotate(90deg);
+}
+
+details summary::-webkit-details-marker {
+  display: none;
+}
+
+details summary:hover {
+  color: #22d3ee;
+}
+
+details[open] summary {
+  color: #22d3ee;
+  border-bottom: 1px solid #1e293b;
+}
+
+details > *:not(summary) {
+  margin: 0;
+}
+
+details pre {
+  margin: 0 !important;
+  border-radius: 0 0 4px 4px !important;
+  border: none !important;
+}
+
+/* global selection color */
+::selection {
+  background: #22d3ee22;
+  color: inherit;
+}
+
+/* strip shiki per-token backgrounds and force upright */
+.astro-code,
+.astro-code * {
+  background-color: #111111 !important;
+  font-style: normal !important;
+}
+
+.astro-code span[style] {
+  background-color: transparent !important;
+}

